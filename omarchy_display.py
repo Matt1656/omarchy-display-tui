@@ -19,6 +19,8 @@ STATE = Path.home() / '.local/state/omarchy-display'
 MANAGED = CONFIG / 'omarchy-display.lua'
 MAIN = CONFIG / 'hyprland.lua'
 SETTINGS = STATE / 'settings.json'
+SHELL = Path.home() / '.config/omarchy/shell.json'
+SHELL_DEFAULTS = Path(os.getenv('OMARCHY_PATH', '/usr/share/omarchy')) / 'config/omarchy/shell.json'
 INCLUDE = 'dofile(os.getenv("HOME") .. "/.config/hypr/omarchy-display.lua")'
 ENV = {
     'GDK_SCALE': ('GTK integer scale', '1', 1, 4, True),
@@ -113,6 +115,42 @@ def env_value(key, value):
     return str(number(value, *ENV[key][2:]))
 
 
+def custom_mode(width, height, refresh):
+    width = number(width, 1, 32768, True)
+    height = number(height, 1, 32768, True)
+    refresh = number(refresh, .01, 1000)
+    return f'{width}x{height}@{refresh:g}'
+
+
+def shell_config(path):
+    data = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(data, dict) or not isinstance(data.get('idle', {}), dict):
+        raise ValueError(f'{path}: expected a JSON object with an idle object')
+    return data
+
+
+def idle_settings():
+    defaults = {'screensaver': 150, 'lock': 300}
+    defaults.update(shell_config(SHELL_DEFAULTS).get('idle', {}))
+    defaults.update(shell_config(SHELL).get('idle', {}))
+    return {k: int(number(defaults[k], 0, 2147483, True)) for k in ('screensaver', 'lock')}
+
+
+def parse_timeout(value):
+    match = re.fullmatch(r'(\d+)\s*([smh]?)', value.strip().lower())
+    if not match:
+        raise ValueError('Enter whole seconds, or a duration such as 5m or 1h; 0 disables.')
+    seconds = int(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[match[2]]
+    return number(seconds, 0, 2147483, True)
+
+
+def render_shell(idle):
+    # Merge against the latest file so bar/plugin settings are preserved.
+    data = shell_config(SHELL)
+    data.setdefault('idle', {}).update(idle)
+    return json.dumps(data, indent=2) + '\n'
+
+
 def validate(settings, connected):
     profiles = settings['monitors']
     if not connected or not any(not profiles[n]['disabled'] for n in connected):
@@ -122,6 +160,9 @@ def validate(settings, connected):
             raise ValueError('Invalid output name')
         if not re.fullmatch(r'(preferred|highres|highrr|\d+x\d+@\d+(\.\d+)?)', m['mode']):
             raise ValueError('Mode must be WIDTHxHEIGHT@HZ or preferred/highres/highrr')
+        if '@' in m['mode']:
+            width, height, refresh = re.split('[x@]', m['mode'])
+            custom_mode(width, height, refresh)
         if m['scale'] != 'auto':
             number(m['scale'], .25, 4)
         if not re.fullmatch(r'(auto|-?\d+x-?\d+)', m['position']):
@@ -133,6 +174,9 @@ def validate(settings, connected):
             raise ValueError('Mirror target must be a different enabled, non-mirrored connected output')
     for key in ENV:
         env_value(key, settings['env'][key])
+    if 'idle' in settings:
+        for key in ('screensaver', 'lock'):
+            number(settings['idle'][key], 0, 2147483, True)
 
 
 def lua(value):
@@ -189,6 +233,15 @@ def finish(transaction, keep):
         status = transaction / 'status'
         if status.read_text() != 'pending':
             return False
+        if keep:
+            pending_idle = transaction / 'idle.json'
+            if pending_idle.exists():
+                try:
+                    atomic(SHELL, render_shell(json.loads(pending_idle.read_text())))
+                except Exception:
+                    restore(transaction)
+                    atomic(status, 'reverted')
+                    raise
         if not keep:
             try:
                 restore(transaction)
@@ -214,6 +267,11 @@ def begin(settings, connected):
     transaction = Path(tempfile.mkdtemp(prefix='backup-', dir=STATE))
     old_env = session_env()
     files = {str(p): p.read_text() if p.exists() else None for p in (MAIN, MANAGED, SETTINGS)}
+    if 'idle' in settings and settings['idle'] != idle_settings():
+        # Delay idle changes until confirmation: a short lock timeout must not
+        # lock the user out of the display confirmation screen.
+        files[str(SHELL)] = SHELL.read_text() if SHELL.exists() else None
+        atomic(transaction / 'idle.json', json.dumps(settings['idle']))
     atomic(transaction / 'snapshot.json', json.dumps({'files': files, 'env': {k: old_env.get(k) for k in ENV}}))
     atomic(transaction / 'status', 'pending')
     # Detached rollback survives a dead terminal or crashed TUI.
@@ -262,6 +320,7 @@ class UI:
         self.monitors = copy.deepcopy(DEMO) if self.demo else discover()
         saved = json.loads(SETTINGS.read_text()) if SETTINGS.exists() and not self.demo else {}
         self.settings = initial(self.monitors, {} if self.demo else session_env(), saved)
+        self.settings['idle'] = {'screensaver': 150, 'lock': 300} if self.demo else idle_settings()
         if not self.demo:
             option = json.loads(run('hyprctl', '-j', 'getoption', 'xwayland:force_zero_scaling'))
             self.settings['xwayland'] = bool(option.get('bool', option.get('int', 1)))
@@ -328,21 +387,24 @@ class UI:
     def monitor(self, monitor):
         m = self.settings['monitors'][monitor['name']]
         while True:
-            keys = ['mode', 'scale', 'position', 'transform', 'disabled', 'vrr', 'mirror']
-            labels = ['Resolution @ refresh', 'Monitor scale', 'Position (logical pixels)', 'Rotation / flip (0–7)', 'Disabled', 'Variable refresh (0–3)', 'Mirror output']
+            keys = ['mode', 'custom', 'scale', 'position', 'transform', 'disabled', 'vrr', 'mirror']
+            labels = ['Resolution @ refresh', 'Custom resolution and refresh rate', 'Monitor scale', 'Position (logical pixels)', 'Rotation / flip (0–7)', 'Disabled', 'Variable refresh (0–3)', 'Mirror output']
             idx = self.menu(monitor['name'] + ' — ' + (monitor.get('description') or 'No display identification'),
-                            [f'{label}: {m[key]}' for label, key in zip(labels, keys)] + ['Back'],
+                            [f'{label}: {m[key]}' if key != 'custom' else label + '…' for label, key in zip(labels, keys)] + ['Back'],
                             'Rotation: 0 normal, 1=90°, 2=180°, 3=270°; 4–7 flipped')
             if idx is None or idx == len(keys):
                 return
             key = keys[idx]
             try:
-                if key == 'mode':
+                if key == 'custom':
+                    value = self.custom_mode(monitor, m)
+                    key = 'mode'
+                elif key == 'mode':
                     choices = mode_choices(monitor)
                     choice = self.menu('Detected modes for ' + monitor['name'], [f'{v}  — {label}' for v, label in choices] + ['Enter custom mode…'], 'Modes come from Hyprland; missing EDID can limit this list.')
                     if choice is None:
                         continue
-                    value = choices[choice][0] if choice < len(choices) else self.prompt('Custom mode', m[key], 'WIDTHxHEIGHT@HZ, e.g. 1920x1080@60. Unsupported modes may fail.')
+                    value = choices[choice][0] if choice < len(choices) else self.custom_mode(monitor, m)
                 elif key == 'disabled':
                     value = not m[key]
                 elif key == 'mirror':
@@ -359,6 +421,40 @@ class UI:
                     self.dirty = True
             except ValueError as exc:
                 self.message = str(exc)
+
+    def custom_mode(self, monitor, profile):
+        mode = profile['mode'] if '@' in profile['mode'] else current_mode(monitor)
+        values = re.split('[x@]', mode) if '@' in mode else ['1920', '1080', '60']
+        for i, label in enumerate(('Width in pixels', 'Height in pixels', 'Refresh rate in Hz')):
+            value = self.prompt('Custom mode — ' + label, values[i],
+                                'Decimal refresh rates supported, e.g. 59.94. Escape cancels the whole edit.')
+            if value is None:
+                return None
+            number(value, .01 if i == 2 else 1, 1000 if i == 2 else 32768, i != 2)
+            values[i] = value
+        return custom_mode(*values)
+
+    def idle(self):
+        keys = ('screensaver', 'lock')
+        while True:
+            values = self.settings['idle']
+            labels = [f'{name}: ' + (f'{values[key]} seconds' if values[key] else 'Disabled')
+                      for name, key in zip(('Screensaver timeout', 'Automatic lock timeout'), keys)]
+            note = 'Both timers start at last activity; 0 disables. Saved only after Apply + Y.'
+            if values['lock'] and values['screensaver'] and values['lock'] <= values['screensaver']:
+                note = 'Lock runs before/with screensaver. Set screensaver earlier to see it before locking.'
+            idx = self.menu('Screensaver and lock settings', labels + ['Back'], note)
+            if idx is None or idx == 2:
+                return
+            key = keys[idx]
+            value = self.prompt(labels[idx].split(':')[0], values[key],
+                                'Seconds since last activity; also accepts 5m or 1h. Enter 0 to disable.')
+            if value is not None:
+                try:
+                    values[key] = parse_timeout(value)
+                    self.dirty = True
+                except ValueError as exc:
+                    self.message = str(exc)
 
     def scaling(self):
         keys = list(ENV)
@@ -419,10 +515,10 @@ class UI:
         selected = 0
         while True:
             items = [f'{m["name"]}  {self.settings["monitors"][m["name"]]["mode"]}  scale {self.settings["monitors"][m["name"]]["scale"]}' for m in self.monitors]
-            actions = ['Application scaling', 'Preview generated configuration', 'Apply staged settings', 'Rescan monitors / discard staged changes', 'Help', 'Quit']
+            actions = ['Application scaling', 'Screensaver and lock settings', 'Preview generated configuration', 'Apply staged settings', 'Rescan monitors / discard staged changes', 'Help', 'Quit']
             selected = self.menu('Connected monitors' + ('  • unsaved changes' if self.dirty else ''), items + actions,
                                  'Multi-monitor profiles are preserved when outputs disconnect.', min(selected or 0, len(items + actions) - 1))
-            if selected is None or selected == len(items) + 5:
+            if selected is None or selected == len(items) + 6:
                 if not self.dirty or self.menu('Discard staged changes and quit?', ['Keep editing', 'Discard and quit']) == 1:
                     return
                 continue
@@ -432,16 +528,23 @@ class UI:
                 elif selected == len(items):
                     self.scaling()
                 elif selected == len(items) + 1:
-                    self.menu('Preview — nothing written', render(self.settings).splitlines())
+                    self.idle()
                 elif selected == len(items) + 2:
-                    self.apply()
+                    self.menu('Preview — nothing written', render(self.settings).splitlines() +
+                              ['', 'Omarchy shell idle settings (applied after confirmation):',
+                               json.dumps(self.settings['idle'])])
                 elif selected == len(items) + 3:
+                    self.apply()
+                elif selected == len(items) + 4:
                     if not self.dirty or self.menu('Discard staged changes and rescan?', ['Cancel', 'Rescan']) == 1:
                         self.refresh()
-                elif selected == len(items) + 4:
+                elif selected == len(items) + 5:
                     self.menu('Help', [
                         'Choose a monitor to edit its mode, scale, position, rotation or mirroring.',
                         'Each mode combines resolution and refresh rate. Current mode is listed separately.',
+                        'Custom resolution and refresh rate: enter width, height and Hz separately.',
+                        'Screensaver/lock: seconds since last activity, or 5m/1h; 0 disables.',
+                        'Idle timers are saved to shell.json only after you confirm display settings.',
                         'Position uses logical pixels: 3840px at scale 2 occupies 1920px.',
                         'Apply writes a separate Lua file, then reloads and validates Hyprland.',
                         'Confirm within 20 seconds; otherwise settings are rolled back.',

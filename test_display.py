@@ -55,13 +55,42 @@ class SettingsTests(unittest.TestCase):
         self.assertIn('hl.env("STEAM_FORCE_DESKTOPUI_SCALING", "1")', text)
         self.assertIn('output = "HDMI-A-1"', text)
 
+    def test_custom_mode_fractional_refresh(self):
+        self.assertEqual(app.custom_mode('1920', '1080', '59.940'), '1920x1080@59.94')
+        self.settings['monitors']['DP-1']['mode'] = '1024x768@84.94'
+        app.validate(self.settings, self.connected)
+
+    def test_custom_mode_invalid_values(self):
+        for values in [('0', '1080', '60'), ('1920.5', '1080', '60'),
+                       ('1920', '1080', 'nan'), ('1920', '1080', '0')]:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                app.custom_mode(*values)
+        self.settings['monitors']['DP-1']['mode'] = '0x1080@60'
+        with self.assertRaises(ValueError):
+            app.validate(self.settings, self.connected)
+
+    def test_timeout_units_and_disabling(self):
+        for value, expected in [('0', 0), ('45', 45), ('5m', 300), ('1h', 3600), ('10 s', 10)]:
+            self.assertEqual(app.parse_timeout(value), expected)
+        for value in ('-1', '1.5m', 'nan', '999999h', ''):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                app.parse_timeout(value)
+
+    def test_custom_wizard_cancel_does_not_change_profile(self):
+        ui = object.__new__(app.UI)
+        profile = self.settings['monitors']['DP-1']
+        old = copy.deepcopy(profile)
+        with patch.object(ui, 'prompt', side_effect=['1920', None]):
+            self.assertIsNone(ui.custom_mode(app.DEMO[0], profile))
+        self.assertEqual(profile, old)
+
 
 class TransactionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for key, name in [('MAIN', 'hyprland.lua'), ('MANAGED', 'managed.lua'), ('SETTINGS', 'settings.json'), ('STATE', 'state')]:
+        for key, name in [('MAIN', 'hyprland.lua'), ('MANAGED', 'managed.lua'), ('SETTINGS', 'settings.json'), ('STATE', 'state'), ('SHELL', 'shell.json'), ('SHELL_DEFAULTS', 'defaults.json')]:
             p = patch.object(app, key, self.root / name)
             p.start()
             self.addCleanup(p.stop)
@@ -105,6 +134,42 @@ class TransactionTests(unittest.TestCase):
         with patch.object(app.time, 'sleep'):
             app.watchdog(transaction)
         self.assertEqual((transaction / 'status').read_text(), 'reverted')
+
+    def test_idle_saved_only_on_keep_preserving_other_settings(self):
+        original = {'bar': {'position': 'left'}, 'idle': {'lock': 300, 'extra': True}, 'plugins': ['example']}
+        app.SHELL.write_text(json.dumps(original))
+        self.settings['idle'] = {'screensaver': 120, 'lock': 600}
+        transaction = app.begin(self.settings, self.connected)
+        self.assertEqual(json.loads(app.SHELL.read_text()), original)
+        app.finish(transaction, True)
+        result = json.loads(app.SHELL.read_text())
+        self.assertEqual(result['bar'], original['bar'])
+        self.assertEqual(result['plugins'], original['plugins'])
+        self.assertEqual(result['idle'], {'screensaver': 120, 'lock': 600, 'extra': True})
+
+    def test_idle_revert_leaves_existing_settings(self):
+        original = '{"idle": {"lock": 300, "screensaver": 600}}\n'
+        app.SHELL.write_text(original)
+        self.settings['idle'] = {'screensaver': 0, 'lock': 0}
+        transaction = app.begin(self.settings, self.connected)
+        app.finish(transaction, False)
+        self.assertEqual(app.SHELL.read_text(), original)
+
+    def test_idle_missing_file_and_defaults(self):
+        app.SHELL_DEFAULTS.write_text('{"idle": {"screensaver": 180, "lock": 420}}')
+        self.assertEqual(app.idle_settings(), {'screensaver': 180, 'lock': 420})
+        self.settings['idle'] = {'screensaver': 0, 'lock': 600}
+        transaction = app.begin(self.settings, self.connected)
+        self.assertFalse(app.SHELL.exists())
+        app.finish(transaction, True)
+        self.assertEqual(app.idle_settings(), self.settings['idle'])
+
+    def test_invalid_shell_does_not_start_transaction(self):
+        app.SHELL.write_text('{broken')
+        self.settings['idle'] = {'screensaver': 0, 'lock': 600}
+        with self.assertRaises(ValueError):
+            app.begin(self.settings, self.connected)
+        self.assertFalse(app.MANAGED.exists())
 
 
 if __name__ == '__main__':
